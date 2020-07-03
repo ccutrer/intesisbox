@@ -1,0 +1,1 @@
+require 'intesis_box'

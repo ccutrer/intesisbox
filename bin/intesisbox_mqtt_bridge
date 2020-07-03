@@ -1,0 +1,162 @@
+#!/usr/bin/env ruby
+
+require 'intesisbox'
+require 'mqtt'
+
+class MQTTBridge
+  def initialize(mqtt_uri, wmp)
+    @base_topic = "homie/intesisbox"
+    @mqtt = MQTT::Client.new(mqtt_uri)
+    @mqtt.set_will("#{@base_topic}/$state", "lost", true)
+    @mqtt.connect
+    @attributes = {}
+
+    publish_basic_attributes
+
+    # TODO: discovery
+
+    wmps = [wmp]
+    wmps.each do |wmp|
+      loop do
+        break if wmp.mac
+        break unless wmp.poll(5)
+      end
+    end
+    raise "no response from some nodes" unless wmps.all? { |wmp| wmp.mac }
+    publish("$nodes", wmps.map(&:mac).join(","))
+    wmps.each { |wmp| publish_wmp(wmp) }
+    publish("$state", "ready")
+
+    wmps.each do |wmp|
+      Thread.new do
+        loop do
+          next wmp.ping unless wmp.poll
+          publish_attribute("#{wmp.mac}/onoff", wmp.onoff)
+          publish_attribute("#{wmp.mac}/mode", wmp.mode) unless wmp.limits[:mode].empty?
+          publish_attribute("#{wmp.mac}/fansp", wmp.fansp) unless wmp.limits[:fansp].empty?
+          publish_attribute("#{wmp.mac}/vaneud", wmp.vaneud) unless wmp.limits[:vaneud].empty?
+          publish_attribute("#{wmp.mac}/vanelr", wmp.vanelr) unless wmp.limits[:vanelr].empty?
+          publish_attribute("#{wmp.mac}/setptemp", wmp.setptemp)
+          publish_attribute("#{wmp.mac}/ambtemp", wmp.ambtemp)
+          publish_attribute("#{wmp.mac}/errstatus", wmp.errstatus)
+          publish_attribute("#{wmp.mac}/errcode", wmp.errcode)
+        end
+      end
+    end
+
+    @wmps = {}
+    wmps.each { |wmp| @wmps[wmp.mac] = wmp }
+
+    @mqtt.get do |topic, value|
+      puts "got #{value.inspect} at #{topic}"
+
+      %r{([0-9A-F]+)/(mode|fansp|vaneud|vanelr|onoff|setptemp)/set$} =~ topic
+      wmp = @wmps[$1]
+      function = $2
+      case function
+      when 'onoff'
+        wmp.onoff = value == 'true'
+      when 'setptemp'
+        wmp.setptemp = value.to_f
+      else
+        wmp.send("#{function}=", value)
+      end
+    end
+  end
+
+  def publish(topic, value)
+    @mqtt.publish("#{@base_topic}/#{topic}", value, true)
+  end
+
+  def publish_attribute(attr, value)
+    if !@attributes.key?(attr) || @attributes[attr] != value
+      publish(attr, value.to_s)
+      @attributes[attr] = value
+    end
+  end
+
+  def subscribe(topic)
+    @mqtt.subscribe("#{@base_topic}/#{topic}")
+  end
+
+  def publish_basic_attributes
+    publish("$homie", "v4.0.0")
+    publish("$name", "IntesisBox")
+    publish("$state", "init")
+  end
+
+  def publish_wmp(wmp)
+    publish("#{wmp.mac}/$name", wmp.devicename)
+    publish("#{wmp.mac}/$type", wmp.model)
+    properties = []
+    
+    properties << 'onoff'
+    publish("#{wmp.mac}/onoff/$name", "AC unit On or Off")
+    publish("#{wmp.mac}/onoff/$datatype", "boolean")
+    publish("#{wmp.mac}/onoff/$settable", "true")
+    subscribe("#{wmp.mac}/onoff/set")
+
+    unless wmp.limits[:mode].empty?
+      properties << 'mode'
+      publish("#{wmp.mac}/mode/$name", "Mode (heat, cool, fan, dry or auto)")
+      publish("#{wmp.mac}/mode/$datatype", "enum")
+      publish("#{wmp.mac}/mode/$format", wmp.limits[:mode].join(","))
+      publish("#{wmp.mac}/mode/$settable", "true")
+      subscribe("#{wmp.mac}/mode/set")
+    end
+
+    unless wmp.limits[:fansp].empty?
+      properties << 'fansp'
+      publish("#{wmp.mac}/fansp/$name", "Fan speed")
+      publish("#{wmp.mac}/fansp/$datatype", "enum")
+      publish("#{wmp.mac}/fansp/$format", wmp.limits[:fansp].join(","))
+      publish("#{wmp.mac}/fansp/$settable", "true")
+      subscribe("#{wmp.mac}/fansp/set")
+    end
+
+    unless wmp.limits[:vaneud].empty?
+      properties << 'vaneud'
+      publish("#{wmp.mac}/vaneud/$name", "Up/Down vane position")
+      publish("#{wmp.mac}/vaneud/$datatype", "enum")
+      publish("#{wmp.mac}/vaneud/$format", wmp.limits[:vaneud].join(","))
+      publish("#{wmp.mac}/vaneud/$settable", "true")
+      subscribe("#{wmp.mac}/vaneud/set")
+    end
+
+    unless wmp.limits[:vanelr].empty?
+      properties << 'vanelr'
+      publish("#{wmp.mac}/vanelr/$name", "Left/Right vane position")
+      publish("#{wmp.mac}/vanelr/$datatype", "enum")
+      publish("#{wmp.mac}/vanelr/$format", wmp.limits[:vanelr].join(","))
+      publish("#{wmp.mac}/vanelr/$settable", "true")
+      subscribe("#{wmp.mac}/vanelr/set")
+    end
+
+    properties << 'setptemp'
+    publish("#{wmp.mac}/setptemp/$name", "Set point temperature")
+    publish("#{wmp.mac}/setptemp/$datatype", "float")
+    publish("#{wmp.mac}/setptemp/$format", wmp.limits[:setptemp].join(":"))
+    publish("#{wmp.mac}/setptemp/$unit", "ºC")
+    publish("#{wmp.mac}/setptemp/$settable", "true")
+    subscribe("#{wmp.mac}/setptemp/set")
+
+    properties << 'ambtemp'
+    publish("#{wmp.mac}/ambtemp/$name", "Ambient temperature")
+    publish("#{wmp.mac}/ambtemp/$datatype", "float")
+    publish("#{wmp.mac}/ambtemp/$unit", "ºC")
+
+    properties << 'errstatus'
+    publish("#{wmp.mac}/errstatus/$name", "Shows if any error occurs")
+    publish("#{wmp.mac}/errstatus/$datatype", "string")
+
+    properties << 'errcode'
+    publish("#{wmp.mac}/errcode/$name", "Error code")
+    publish("#{wmp.mac}/errcode/$datatype", "integer")
+
+    publish("#{wmp.mac}/$properties", properties.join(","))
+  end
+end
+
+mqtt_uri = ARGV[0]
+wmp = IntesisBox::Client.new(ARGV[1])
+MQTTBridge.new(mqtt_uri, wmp)
