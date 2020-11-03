@@ -4,54 +4,41 @@ require 'intesisbox'
 require 'mqtt'
 
 class MQTTBridge
-  def initialize(mqtt_uri, wmp)
+  def initialize(mqtt_uri)
     @base_topic = "homie/intesisbox"
     @mqtt = MQTT::Client.new(mqtt_uri)
     @mqtt.set_will("#{@base_topic}/$state", "lost", true)
     @mqtt.connect
     @attributes = {}
+    @wmps = {}
+    @discovery = 300
 
     publish_basic_attributes
+    publish("$nodes", "bridge")
 
-    # TODO: discovery
-
-    wmps = [wmp]
-    wmps.each do |wmp|
-      loop do
-        break if wmp.mac
-        break unless wmp.poll(5)
-      end
-    end
-    raise "no response from some nodes" unless wmps.all? { |wmp| wmp.mac }
-    publish("$nodes", wmps.map(&:mac).join(","))
-    wmps.each { |wmp| publish_wmp(wmp) }
-    publish("$state", "ready")
-
-    wmps.each do |wmp|
-      Thread.new do
-        loop do
-          next wmp.ping unless wmp.poll
-          publish_attribute("#{wmp.mac}/onoff", wmp.onoff)
-          publish_attribute("#{wmp.mac}/mode", wmp.mode) unless wmp.limits[:mode].empty?
-          publish_attribute("#{wmp.mac}/fansp", wmp.fansp) unless wmp.limits[:fansp].empty?
-          publish_attribute("#{wmp.mac}/vaneud", wmp.vaneud) unless wmp.limits[:vaneud].empty?
-          publish_attribute("#{wmp.mac}/vanelr", wmp.vanelr) unless wmp.limits[:vanelr].empty?
-          publish_attribute("#{wmp.mac}/setptemp", wmp.setptemp)
-          publish_attribute("#{wmp.mac}/ambtemp", wmp.ambtemp)
-          publish_attribute("#{wmp.mac}/errstatus", wmp.errstatus)
-          publish_attribute("#{wmp.mac}/errcode", wmp.errcode)
-        end
-      end
-    end
-
-    @wmps = {}
-    wmps.each { |wmp| @wmps[wmp.mac] = wmp }
+    start_discovery_thread
 
     @mqtt.get do |topic, value|
       puts "got #{value.inspect} at #{topic}"
+      topic = topic[(@base_topic.length + 1)..-1]
+
+      if topic == 'bridge/discovery/set' && value =~ /^\d+$/
+        old_discovery = @discovery
+        discovery = value.to_i
+        next if discovery > 86400
+        @discovery = discovery
+
+        publish("bridge/discovery", @discovery)
+        if @discovery < old_discovery || old_discovery == 0
+          @discovery_thread.kill
+          start_discovery_thread
+        end
+        next
+      end
 
       %r{([0-9A-F]+)/(mode|fansp|vaneud|vanelr|onoff|setptemp)/set$} =~ topic
       wmp = @wmps[$1]
+      next unless wmp
       function = $2
       case function
       when 'onoff'
@@ -64,8 +51,73 @@ class MQTTBridge
     end
   end
 
+  def start_discovery_thread
+    @discovery_thread = Thread.new do
+      discover
+      loop do
+        break if @discovery == 0
+        sleep(@discovery)
+        discover
+      end
+    end
+  end
+
+  def discover
+    wmp_details = IntesisBox::Discovery.discover
+
+    # force a reconnect to WMPs that have moved
+    wmp_details.each do |(mac, details)|
+      known_wmp = @wmps[mac]
+      if known_wmp && known_wmp.ip != details[:ip]
+        @wmps.delete(mac)
+      end
+    end
+
+    known_macs = @wmps.keys.to_set
+    wmp_details.reject! { |(mac, details)| known_macs.include?(mac)} 
+
+    return if wmp_details.empty?
+
+    publish("$state", "init")
+    wmps = wmp_details.map { |(mac, details)| IntesisBox::Client.new(details[:ip])}
+
+    wmps.each do |wmp|
+      loop do
+        break if wmp.mac
+        unless wmp.poll(1)
+          puts "unable to talk to #{wmp.mac}"
+          break
+        end
+      end
+    end
+    wmps.delete_if { |wmp| !wmp.mac }
+
+    wmps.each { |wmp| publish_wmp(wmp) }
+
+    wmps.each do |wmp|
+      Thread.new do
+        loop do
+          next wmp.ping unless wmp.poll
+          publish_attribute("#{wmp.mac}/onoff", wmp.onoff)
+          publish_attribute("#{wmp.mac}/mode", wmp.mode) if wmp.limits[:mode]&.length.to_i > 0
+          publish_attribute("#{wmp.mac}/fansp", wmp.fansp) if wmp.limits[:fansp]&.length.to_i > 0
+          publish_attribute("#{wmp.mac}/vaneud", wmp.vaneud) if wmp.limits[:vaneud]&.length.to_i > 0
+          publish_attribute("#{wmp.mac}/vanelr", wmp.vanelr) if wmp.limits[:vanelr]&.length.to_i > 0
+          publish_attribute("#{wmp.mac}/setptemp", wmp.setptemp)
+          publish_attribute("#{wmp.mac}/ambtemp", wmp.ambtemp) if wmp.ambtemp
+          publish_attribute("#{wmp.mac}/errstatus", wmp.errstatus)
+          publish_attribute("#{wmp.mac}/errcode", wmp.errcode)
+        end
+      end
+    end
+
+    wmps.each { |wmp| @wmps[wmp.mac] = wmp }
+    publish("$nodes", (["bridge"] + @wmps.keys.sort).join(","))
+    publish("$state", "ready")
+  end
+
   def publish(topic, value)
-    @mqtt.publish("#{@base_topic}/#{topic}", value, true)
+    @mqtt.publish("#{@base_topic}/#{topic}", value, true, 1)
   end
 
   def publish_attribute(attr, value)
@@ -83,6 +135,18 @@ class MQTTBridge
     publish("$homie", "v4.0.0")
     publish("$name", "IntesisBox")
     publish("$state", "init")
+
+    publish("bridge/$name", "Bridge")
+    publish("bridge/$type", "Bridge")
+    publish("bridge/$properties", "discover")
+
+    publish("bridge/discovery/$name", "Auto-Discovery Interval")
+    publish("bridge/discovery/$datatype", "integer")
+    publish("bridge/discovery/$settable", "true")
+    publish("bridge/discovery/$format", "0:86400")
+    publish("bridge/discovery/$unit", "s")
+    publish("bridge/discovery", @discovery)
+    subscribe("bridge/discovery/set")
   end
 
   def publish_wmp(wmp)
@@ -96,7 +160,7 @@ class MQTTBridge
     publish("#{wmp.mac}/onoff/$settable", "true")
     subscribe("#{wmp.mac}/onoff/set")
 
-    unless wmp.limits[:mode].empty?
+    if wmp.limits[:mode]&.length.to_i > 0
       properties << 'mode'
       publish("#{wmp.mac}/mode/$name", "Mode (heat, cool, fan, dry or auto)")
       publish("#{wmp.mac}/mode/$datatype", "enum")
@@ -105,7 +169,7 @@ class MQTTBridge
       subscribe("#{wmp.mac}/mode/set")
     end
 
-    unless wmp.limits[:fansp].empty?
+    if wmp.limits[:fansp]&.length.to_i > 0
       properties << 'fansp'
       publish("#{wmp.mac}/fansp/$name", "Fan speed")
       publish("#{wmp.mac}/fansp/$datatype", "enum")
@@ -114,7 +178,7 @@ class MQTTBridge
       subscribe("#{wmp.mac}/fansp/set")
     end
 
-    unless wmp.limits[:vaneud].empty?
+    if wmp.limits[:vaneud]&.length.to_i > 0
       properties << 'vaneud'
       publish("#{wmp.mac}/vaneud/$name", "Up/Down vane position")
       publish("#{wmp.mac}/vaneud/$datatype", "enum")
@@ -123,7 +187,7 @@ class MQTTBridge
       subscribe("#{wmp.mac}/vaneud/set")
     end
 
-    unless wmp.limits[:vanelr].empty?
+    if wmp.limits[:vanelr]&.length.to_i > 0
       properties << 'vanelr'
       publish("#{wmp.mac}/vanelr/$name", "Left/Right vane position")
       publish("#{wmp.mac}/vanelr/$datatype", "enum")
@@ -140,10 +204,12 @@ class MQTTBridge
     publish("#{wmp.mac}/setptemp/$settable", "true")
     subscribe("#{wmp.mac}/setptemp/set")
 
-    properties << 'ambtemp'
-    publish("#{wmp.mac}/ambtemp/$name", "Ambient temperature")
-    publish("#{wmp.mac}/ambtemp/$datatype", "float")
-    publish("#{wmp.mac}/ambtemp/$unit", "ºC")
+    if wmp.ambtemp
+      properties << 'ambtemp'
+      publish("#{wmp.mac}/ambtemp/$name", "Ambient temperature")
+      publish("#{wmp.mac}/ambtemp/$datatype", "float")
+      publish("#{wmp.mac}/ambtemp/$unit", "ºC")
+    end
 
     properties << 'errstatus'
     publish("#{wmp.mac}/errstatus/$name", "Shows if any error occurs")
@@ -158,5 +224,4 @@ class MQTTBridge
 end
 
 mqtt_uri = ARGV[0]
-wmp = IntesisBox::Client.new(ARGV[1])
-MQTTBridge.new(mqtt_uri, wmp)
+MQTTBridge.new(mqtt_uri)

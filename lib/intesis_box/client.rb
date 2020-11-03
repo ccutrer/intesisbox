@@ -2,19 +2,25 @@ require 'socket'
 
 module IntesisBox
   class Client
-    attr_reader :model, :mac, :version, :rssi
+    attr_reader :ip, :model, :mac, :version, :rssi
     attr_reader :limits
     attr_reader :devicename
     attr_reader :onoff, :mode, :fansp, :vaneud, :vanelr, :setptemp, :ambtemp, :errstatus, :errcode
 
     def initialize(ip, port = 3310)
+      @limits = {}
+      @ip = ip
       @io = TCPSocket.new(ip, port)
+
       @io.puts("LIMITS:*")
+      poll(1)
       @io.puts("CFG:DEVICENAME")
+      poll(1)
       @io.puts("GET,1:*")
+      poll(1)
       # this is purposely last, since mac is what we check for it being ready
       @io.puts("ID")
-      @limits = {}
+      poll(1)
     end
 
     def poll(timeout = 30)
@@ -37,6 +43,7 @@ module IntesisBox
           value = value == 'ON' if function == 'ONOFF'
           value = value.to_f / 10 if %w{SETPTEMP AMBTEMP}.include?(function)
           value = value.to_i if function == 'ERRCODE'
+          value = nil if value == -3276.8
           instance_variable_set(:"@#{function.downcase}", value)
         when "CFG"
           function, value = args.split(",", 2)
