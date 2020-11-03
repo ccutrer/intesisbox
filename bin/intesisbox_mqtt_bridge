@@ -12,6 +12,7 @@ class MQTTBridge
     @attributes = {}
     @wmps = {}
     @discovery = 300
+    @units = :C
 
     publish_basic_attributes
     publish("$nodes", "bridge")
@@ -22,16 +23,45 @@ class MQTTBridge
       puts "got #{value.inspect} at #{topic}"
       topic = topic[(@base_topic.length + 1)..-1]
 
-      if topic == 'bridge/discovery/set' && value =~ /^\d+$/
+      if topic =~ %r{^bridge/discovery(/set)?$} && value =~ /^\d+$/
         old_discovery = @discovery
         discovery = value.to_i
         next if discovery > 86400
         @discovery = discovery
+        if $1.nil?
+          unsubscribe("bridge/discovery")
+        end
 
         publish("bridge/discovery", @discovery)
         if @discovery < old_discovery || old_discovery == 0
           @discovery_thread.kill
           start_discovery_thread
+        end
+        next
+      elsif topic =~ %r{^bridge/units(/set)?$} && %w{C F}.include?(value)
+        old_units = @units
+        @units = value.to_sym
+        if $1.nil?
+          unsubscribe("bridge/units")
+        end
+
+        if old_units != @units
+          publish("bridge/units", @units)
+          next if @wmps.empty?
+          publish("$state", "init")
+
+  
+          @wmps.each do |(mac, wmp)|
+            publish_attribute("#{mac}/setptemp", convert_units(wmp.setptemp))
+            publish("#{mac}/setptemp/$unit", "º#{@units}")
+            publish("#{mac}/setptemp/$format",
+              wmp.limits[:setptemp].map { |lim| convert_units(lim) }.join(":"))
+            if wmp.ambtemp
+              publish_attribute("#{mac}/ambtemp", convert_units(wmp.ambtemp))
+              publish("#{mac}/ambtemp/$unit", "º#{@units}")
+            end
+          end
+          publish("$state", "ready")
         end
         next
       end
@@ -103,8 +133,8 @@ class MQTTBridge
           publish_attribute("#{wmp.mac}/fansp", wmp.fansp) if wmp.limits[:fansp]&.length.to_i > 0
           publish_attribute("#{wmp.mac}/vaneud", wmp.vaneud) if wmp.limits[:vaneud]&.length.to_i > 0
           publish_attribute("#{wmp.mac}/vanelr", wmp.vanelr) if wmp.limits[:vanelr]&.length.to_i > 0
-          publish_attribute("#{wmp.mac}/setptemp", wmp.setptemp)
-          publish_attribute("#{wmp.mac}/ambtemp", wmp.ambtemp) if wmp.ambtemp
+          publish_attribute("#{wmp.mac}/setptemp", convert_units(wmp.setptemp))
+          publish_attribute("#{wmp.mac}/ambtemp", convert_units(wmp.ambtemp)) if wmp.ambtemp
           publish_attribute("#{wmp.mac}/errstatus", wmp.errstatus)
           publish_attribute("#{wmp.mac}/errcode", wmp.errcode)
         end
@@ -131,6 +161,10 @@ class MQTTBridge
     @mqtt.subscribe("#{@base_topic}/#{topic}")
   end
 
+  def unsubscribe(topic)
+    @mqtt.unsubscribe("#{@base_topic}/#{topic}")
+  end
+
   def publish_basic_attributes
     publish("$homie", "v4.0.0")
     publish("$name", "IntesisBox")
@@ -146,7 +180,16 @@ class MQTTBridge
     publish("bridge/discovery/$format", "0:86400")
     publish("bridge/discovery/$unit", "s")
     publish("bridge/discovery", @discovery)
+    subscribe("bridge/discovery")
     subscribe("bridge/discovery/set")
+
+    publish("bridge/units/$name", "Units")
+    publish("bridge/units/$datatype", "enum")
+    publish("bridge/units/$settable", "true")
+    publish("bridge/units/$format", "C,F")
+    publish("bridge/units", @units)
+    subscribe("bridge/units")
+    subscribe("bridge/units/set")
   end
 
   def publish_wmp(wmp)
@@ -199,8 +242,9 @@ class MQTTBridge
     properties << 'setptemp'
     publish("#{wmp.mac}/setptemp/$name", "Set point temperature")
     publish("#{wmp.mac}/setptemp/$datatype", "float")
-    publish("#{wmp.mac}/setptemp/$format", wmp.limits[:setptemp].join(":"))
-    publish("#{wmp.mac}/setptemp/$unit", "ºC")
+    publish("#{wmp.mac}/setptemp/$format",
+      wmp.limits[:setptemp].map { |lim| convert_units(lim) }.join(":"))
+    publish("#{wmp.mac}/setptemp/$unit", "º#{@units}")
     publish("#{wmp.mac}/setptemp/$settable", "true")
     subscribe("#{wmp.mac}/setptemp/set")
 
@@ -208,7 +252,7 @@ class MQTTBridge
       properties << 'ambtemp'
       publish("#{wmp.mac}/ambtemp/$name", "Ambient temperature")
       publish("#{wmp.mac}/ambtemp/$datatype", "float")
-      publish("#{wmp.mac}/ambtemp/$unit", "ºC")
+      publish("#{wmp.mac}/ambtemp/$unit", "º#{@units}")
     end
 
     properties << 'errstatus'
@@ -220,6 +264,11 @@ class MQTTBridge
     publish("#{wmp.mac}/errcode/$datatype", "integer")
 
     publish("#{wmp.mac}/$properties", properties.join(","))
+  end
+
+  def convert_units(value)
+    return value if @units == :C
+    value * 9/5.0 + 32
   end
 end
 
