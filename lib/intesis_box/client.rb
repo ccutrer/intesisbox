@@ -76,5 +76,11 @@ module IntesisBox
       return if limits[:setptemp] && (value < limits[:setptemp].first || value > limits[:setptemp].last)
       @io.puts("SET,1:SETPTEMP,#{value * 10}")
     end
+
+    def devicename=(value)
+      @io.puts("CFG:DEVICENAME,#{value}")
+      # have to re-query to ensure it got the new value
+      @io.puts("CFG:DEVICENAME")
+    end
   end
 end
