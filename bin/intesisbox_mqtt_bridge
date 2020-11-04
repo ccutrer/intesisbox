@@ -17,6 +17,7 @@ class MQTTBridge
     publish_basic_attributes
     publish("$nodes", "bridge")
 
+    setup_discovery
     start_discovery_thread
 
     @mqtt.get do |topic, value|
@@ -77,8 +78,13 @@ class MQTTBridge
       end
 
       %r{([0-9A-F]+)/(mode|fansp|vaneud|vanelr|onoff|setptemp)/set$} =~ topic
+
       wmp = @wmps[$1]
-      next unless wmp
+      unless wmp
+        @discovery_object.discover
+        next
+      end
+
       function = $2
       case function
       when 'onoff'
@@ -93,35 +99,29 @@ class MQTTBridge
 
   def start_discovery_thread
     @discovery_thread = Thread.new do
-      discover
+      @discovery_object.discover
       loop do
         break if @discovery == 0
         sleep(@discovery)
-        discover
+        @discovery_object.discover
       end
     end
   end
 
-  def discover
-    wmp_details = IntesisBox::Discovery.discover
-
-    # force a reconnect to WMPs that have moved
-    wmp_details.each do |(mac, details)|
+  def setup_discovery
+    @discovery_object = IntesisBox::Discovery.new do |details|
+      # force a reconnect to WMPs that have moved
+      mac = details[:mac]
       known_wmp = @wmps[mac]
       if known_wmp && known_wmp.ip != details[:ip]
         @wmps.delete(mac)
       end
-    end
 
-    known_macs = @wmps.keys.to_set
-    wmp_details.reject! { |(mac, details)| known_macs.include?(mac)} 
+      next true if @wmps.key?(mac)
 
-    return if wmp_details.empty?
+      publish("$state", "init")
+      wmp = IntesisBox::Client.new(details[:ip])
 
-    publish("$state", "init")
-    wmps = wmp_details.map { |(mac, details)| IntesisBox::Client.new(details[:ip])}
-
-    wmps.each do |wmp|
       loop do
         break if wmp.mac
         unless wmp.poll(1)
@@ -129,12 +129,11 @@ class MQTTBridge
           break
         end
       end
-    end
-    wmps.delete_if { |wmp| !wmp.mac }
+      next true unless wmp.mac
 
-    wmps.each { |wmp| publish_wmp(wmp) }
+      # todo: skip this, and kill the thread if it's a previously known wmp?
+      publish_wmp(wmp)
 
-    wmps.each do |wmp|
       Thread.new do
         loop do
           next wmp.ping unless wmp.poll
@@ -143,17 +142,17 @@ class MQTTBridge
           publish_attribute("#{wmp.mac}/fansp", wmp.fansp) if wmp.limits[:fansp]&.length.to_i > 0
           publish_attribute("#{wmp.mac}/vaneud", wmp.vaneud) if wmp.limits[:vaneud]&.length.to_i > 0
           publish_attribute("#{wmp.mac}/vanelr", wmp.vanelr) if wmp.limits[:vanelr]&.length.to_i > 0
-          publish_attribute("#{wmp.mac}/setptemp", convert_units(wmp.setptemp))
+          publish_attribute("#{wmp.mac}/setptemp", convert_units(wmp.setptemp)) if wmp.setptemp
           publish_attribute("#{wmp.mac}/ambtemp", convert_units(wmp.ambtemp)) if wmp.ambtemp
           publish_attribute("#{wmp.mac}/errstatus", wmp.errstatus)
           publish_attribute("#{wmp.mac}/errcode", wmp.errcode)
         end
       end
+      @wmps[wmp.mac] = wmp
+      publish("$nodes", (["bridge"] + @wmps.keys.sort).join(","))
+      publish("$state", "ready")
+      true
     end
-
-    wmps.each { |wmp| @wmps[wmp.mac] = wmp }
-    publish("$nodes", (["bridge"] + @wmps.keys.sort).join(","))
-    publish("$state", "ready")
   end
 
   def publish(topic, value)
@@ -198,6 +197,13 @@ class MQTTBridge
     publish("bridge/units/$format", "C,F")
     subscribe("bridge/units")
     subscribe("bridge/units/set")
+
+    subscribe("+/onoff/set")
+    subscribe("+/mode/set")
+    subscribe("+/fansp/set")
+    subscribe("+/vaneud/set")
+    subscribe("+/vanelr/set")
+    subscribe("+/setptemp/set")
   end
 
   def publish_wmp(wmp)
@@ -209,7 +215,6 @@ class MQTTBridge
     publish("#{wmp.mac}/onoff/$name", "AC unit On or Off")
     publish("#{wmp.mac}/onoff/$datatype", "boolean")
     publish("#{wmp.mac}/onoff/$settable", "true")
-    subscribe("#{wmp.mac}/onoff/set")
 
     if wmp.limits[:mode]&.length.to_i > 0
       properties << 'mode'
@@ -217,7 +222,6 @@ class MQTTBridge
       publish("#{wmp.mac}/mode/$datatype", "enum")
       publish("#{wmp.mac}/mode/$format", wmp.limits[:mode].join(","))
       publish("#{wmp.mac}/mode/$settable", "true")
-      subscribe("#{wmp.mac}/mode/set")
     end
 
     if wmp.limits[:fansp]&.length.to_i > 0
@@ -226,7 +230,6 @@ class MQTTBridge
       publish("#{wmp.mac}/fansp/$datatype", "enum")
       publish("#{wmp.mac}/fansp/$format", wmp.limits[:fansp].join(","))
       publish("#{wmp.mac}/fansp/$settable", "true")
-      subscribe("#{wmp.mac}/fansp/set")
     end
 
     if wmp.limits[:vaneud]&.length.to_i > 0
@@ -235,7 +238,6 @@ class MQTTBridge
       publish("#{wmp.mac}/vaneud/$datatype", "enum")
       publish("#{wmp.mac}/vaneud/$format", wmp.limits[:vaneud].join(","))
       publish("#{wmp.mac}/vaneud/$settable", "true")
-      subscribe("#{wmp.mac}/vaneud/set")
     end
 
     if wmp.limits[:vanelr]&.length.to_i > 0
@@ -244,7 +246,6 @@ class MQTTBridge
       publish("#{wmp.mac}/vanelr/$datatype", "enum")
       publish("#{wmp.mac}/vanelr/$format", wmp.limits[:vanelr].join(","))
       publish("#{wmp.mac}/vanelr/$settable", "true")
-      subscribe("#{wmp.mac}/vanelr/set")
     end
 
     properties << 'setptemp'
@@ -254,7 +255,6 @@ class MQTTBridge
       wmp.limits[:setptemp].map { |lim| convert_units(lim) }.join(":"))
     publish("#{wmp.mac}/setptemp/$unit", "º#{@units}")
     publish("#{wmp.mac}/setptemp/$settable", "true")
-    subscribe("#{wmp.mac}/setptemp/set")
 
     properties << 'ambtemp'
     publish("#{wmp.mac}/ambtemp/$name", "Ambient temperature")

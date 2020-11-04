@@ -72,8 +72,9 @@ module IntesisBox
     end
 
     def setptemp=(value)
+      value = value.round
       return if limits[:setptemp] && (value < limits[:setptemp].first || value > limits[:setptemp].last)
-      @io.puts("SET,1:SETPTEMP,#{(value * 10).to_i}")
+      @io.puts("SET,1:SETPTEMP,#{value * 10}")
     end
   end
 end
