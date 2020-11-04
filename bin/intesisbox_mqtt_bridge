@@ -23,27 +23,37 @@ class MQTTBridge
       puts "got #{value.inspect} at #{topic}"
       topic = topic[(@base_topic.length + 1)..-1]
 
-      if topic =~ %r{^bridge/discovery(/set)?$} && value =~ /^\d+$/
+      if topic =~ %r{^bridge/discovery(/set)?$}
+        if $1.nil?
+          unsubscribe("bridge/discovery")
+          next if @got_discovery
+          @got_discovery = true
+        end
+        next unless value =~ /^\d+$/
+
         old_discovery = @discovery
         discovery = value.to_i
         next if discovery > 86400
         @discovery = discovery
-        if $1.nil?
-          unsubscribe("bridge/discovery")
+
+        if @discovery != old_discovery
+          publish("bridge/discovery", @discovery)
         end
 
-        publish("bridge/discovery", @discovery)
         if @discovery < old_discovery || old_discovery == 0
           @discovery_thread.kill
           start_discovery_thread
         end
         next
       elsif topic =~ %r{^bridge/units(/set)?$} && %w{C F}.include?(value)
-        old_units = @units
-        @units = value.to_sym
         if $1.nil?
           unsubscribe("bridge/units")
+          next if @got_units
+          @got_units = true
         end
+
+        old_units = @units
+        @units = value.to_sym
 
         if old_units != @units
           publish("bridge/units", @units)
@@ -74,7 +84,7 @@ class MQTTBridge
       when 'onoff'
         wmp.onoff = value == 'true'
       when 'setptemp'
-        wmp.setptemp = value.to_f
+        wmp.setptemp = convert_units_set(value.to_f)
       else
         wmp.send("#{function}=", value)
       end
@@ -179,7 +189,6 @@ class MQTTBridge
     publish("bridge/discovery/$settable", "true")
     publish("bridge/discovery/$format", "0:86400")
     publish("bridge/discovery/$unit", "s")
-    publish("bridge/discovery", @discovery)
     subscribe("bridge/discovery")
     subscribe("bridge/discovery/set")
 
@@ -187,7 +196,6 @@ class MQTTBridge
     publish("bridge/units/$datatype", "enum")
     publish("bridge/units/$settable", "true")
     publish("bridge/units/$format", "C,F")
-    publish("bridge/units", @units)
     subscribe("bridge/units")
     subscribe("bridge/units/set")
   end
@@ -248,12 +256,10 @@ class MQTTBridge
     publish("#{wmp.mac}/setptemp/$settable", "true")
     subscribe("#{wmp.mac}/setptemp/set")
 
-    if wmp.ambtemp
-      properties << 'ambtemp'
-      publish("#{wmp.mac}/ambtemp/$name", "Ambient temperature")
-      publish("#{wmp.mac}/ambtemp/$datatype", "float")
-      publish("#{wmp.mac}/ambtemp/$unit", "º#{@units}")
-    end
+    properties << 'ambtemp'
+    publish("#{wmp.mac}/ambtemp/$name", "Ambient temperature")
+    publish("#{wmp.mac}/ambtemp/$datatype", "float")
+    publish("#{wmp.mac}/ambtemp/$unit", "º#{@units}")
 
     properties << 'errstatus'
     publish("#{wmp.mac}/errstatus/$name", "Shows if any error occurs")
@@ -270,6 +276,12 @@ class MQTTBridge
     return value if @units == :C
     value * 9/5.0 + 32
   end
+
+  def convert_units_set(value)
+    return value if @units == :C
+    (value - 32) * 5/9.0
+  end
+
 end
 
 mqtt_uri = ARGV[0]
