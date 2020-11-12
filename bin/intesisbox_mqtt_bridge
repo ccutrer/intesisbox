@@ -131,12 +131,13 @@ class MQTTBridge
       end
       next true unless wmp.mac
 
-      # todo: skip this, and kill the thread if it's a previously known wmp?
+      puts "Found new WMP #{wmp.mac} (#{wmp.devicename})"
       publish_wmp(wmp)
 
       Thread.new do
         loop do
           next wmp.ping unless wmp.poll
+          publish_attribute("#{wmp.mac}/ip", wmp.ip)
           publish_attribute("#{wmp.mac}/onoff", wmp.onoff)
           publish_attribute("#{wmp.mac}/mode", wmp.mode) if wmp.limits[:mode]&.length.to_i > 0
           publish_attribute("#{wmp.mac}/fansp", wmp.fansp) if wmp.limits[:fansp]&.length.to_i > 0
@@ -149,6 +150,9 @@ class MQTTBridge
           publish_attribute("#{wmp.mac}/devicename", wmp.devicename)
           publish_attribute("#{wmp.mac}/$name", wmp.devicename)
         end
+      rescue => e
+        puts "Lost connection to #{wmp.mac} (#{wmp.devicename}): #{e}"
+        remove_wmp(wmp)
       end
       @wmps[wmp.mac] = wmp
       publish("$nodes", (["bridge"] + @wmps.keys.sort).join(","))
@@ -214,11 +218,15 @@ class MQTTBridge
     publish("#{wmp.mac}/$type", wmp.model)
     properties = []
     
-    properties << "devicenmae"
+    properties << "devicename"
     publish("#{wmp.mac}/devicename/$name", "Device Name")
     publish("#{wmp.mac}/devicename/$datatype", "string")
     publish("#{wmp.mac}/devicename/$settable", "true")
-    
+
+    properties << "ip"
+    publish("#{wmp.mac}/ip/$name", "IP Address")
+    publish("#{wmp.mac}/ip/$datatype", "string")
+
     properties << 'onoff'
     publish("#{wmp.mac}/onoff/$name", "AC unit On or Off")
     publish("#{wmp.mac}/onoff/$datatype", "boolean")
@@ -279,6 +287,14 @@ class MQTTBridge
 
     publish("#{wmp.mac}/$properties", properties.join(","))
   end
+
+  def remove_wmp(wmp)
+    @wmps.delete(wmp.mac)
+    @mqtt.publish("$state", "init")
+    publish("$nodes", (["bridge"] + @wmps.keys.sort).join(","))
+    publish("$state", "ready")
+  end
+
 
   def convert_units(value)
     return value if @units == :C
