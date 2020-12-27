@@ -1,100 +1,77 @@
 #!/usr/bin/env ruby
 
 require 'intesisbox'
-require 'mqtt'
+require 'homie-mqtt'
 
 class MQTTBridge
-  def initialize(mqtt_uri)
+  def initialize(mqtt_uri, root_topic: nil)
     @base_topic = "homie/intesisbox"
-    @mqtt = MQTT::Client.new(mqtt_uri)
-    @mqtt.set_will("#{@base_topic}/$state", "lost", true)
-    @mqtt.connect
-    @attributes = {}
+
+    bridge, discovery_property, units_property = nil
+    @device = MQTT::Homie::Device.new("intesisbox", "IntesisBox", root_topic: root_topic, mqtt: mqtt_uri) do |topic, value|
+      if topic == discovery_property.topic
+        @device.mqtt.unsubscribe(topic)
+        discovery_property.set(value) unless @got_discovery
+        @got_discovery = true
+      elsif topic == units_property.topic
+        @device.mqtt.unsubscribe(topic)
+        units_property.set(value) unless @got_units
+        @got_units = true
+      end
+    end
+
     @wmps = {}
     @discovery = 300
     @units = :C
 
-    publish_basic_attributes
-    publish("$nodes", "bridge")
+    bridge = nil
+    @device.node("bridge", "Bridge", "Bridge") do |node|
+      (bridge = node).property("discovery", "Auto-Discovery Interval", :integer, format: "0:86400", unit: "s") do |prop, value|
+        next unless value =~ /^\d+$/
+        value = value.to_i
+        next if value > 86400
+        old_value = @discovery
+        prop.value = value
+        @discovery = value
+        if value < old_value || old_value == 0
+          @discovery_thread.kill
+          start_discovery_thread
+        end
+      end.
+      property("units", "Units", :enum, format: "C,F") do |prop, value|
+        next unless %w{C F}.include?(value)
+        if prop.value != value
+          prop.value = value
+          @units = value
+          next if @wmps.empty?
+          @device.init do
+            @wmps.each do |(mac, wmp)|
+              node = @device.nodes[mac]
+              setptemp = node.properties['setptemp']
+              setptemp.value = convert_units(wmp.setptemp)
+              setptemp.unit = "º#{@units}"
+              setptemp.format = wmp.limits[:setptemp].map { |lim| convert_units(lim) }.join(":")
+              if wmp.ambtemp
+                ambtemp = node.properties['ambtemp']
+                ambtemp.value = convert_units(wmp.ambtemp)
+                ambtemp.unit = "º#{@units}"
+              end
+            end
+          end
+        end
+      end
+    end
+    discovery_property = bridge.properties['discovery']
+    units_property = bridge.properties['units']
+    @device.publish
+    # use MQTT itself as our state store
+    @device.mqtt.subscribe("#{discovery_property.topic}")
+    @device.mqtt.subscribe("#{units_property.topic}")
 
     setup_discovery
     start_discovery_thread
 
-    @mqtt.get do |topic, value|
-      puts "got #{value.inspect} at #{topic}"
-      topic = topic[(@base_topic.length + 1)..-1]
-
-      if topic =~ %r{^bridge/discovery(/set)?$}
-        if $1.nil?
-          unsubscribe("bridge/discovery")
-          next if @got_discovery
-          @got_discovery = true
-        end
-        next unless value =~ /^\d+$/
-
-        old_discovery = @discovery
-        discovery = value.to_i
-        next if discovery > 86400
-        @discovery = discovery
-
-        if @discovery != old_discovery
-          publish("bridge/discovery", @discovery)
-        end
-
-        if @discovery < old_discovery || old_discovery == 0
-          @discovery_thread.kill
-          start_discovery_thread
-        end
-        next
-      elsif topic =~ %r{^bridge/units(/set)?$} && %w{C F}.include?(value)
-        if $1.nil?
-          unsubscribe("bridge/units")
-          next if @got_units
-          @got_units = true
-        end
-
-        old_units = @units
-        @units = value.to_sym
-
-        if old_units != @units
-          publish("bridge/units", @units)
-          next if @wmps.empty?
-          publish("$state", "init")
-
-  
-          @wmps.each do |(mac, wmp)|
-            publish_attribute("#{mac}/setptemp", convert_units(wmp.setptemp))
-            publish("#{mac}/setptemp/$unit", "º#{@units}")
-            publish("#{mac}/setptemp/$format",
-              wmp.limits[:setptemp].map { |lim| convert_units(lim) }.join(":"))
-            if wmp.ambtemp
-              publish_attribute("#{mac}/ambtemp", convert_units(wmp.ambtemp))
-              publish("#{mac}/ambtemp/$unit", "º#{@units}")
-            end
-          end
-          publish("$state", "ready")
-        end
-        next
-      end
-
-      %r{([0-9A-F]+)/(devicename|mode|fansp|vaneud|vanelr|onoff|setptemp)/set$} =~ topic
-
-      wmp = @wmps[$1]
-      unless wmp
-        @discovery_object.discover
-        next
-      end
-
-      function = $2
-      case function
-      when 'onoff'
-        wmp.onoff = value == 'true'
-      when 'setptemp'
-        wmp.setptemp = convert_units_set(value.to_f)
-      else
-        wmp.send("#{function}=", value)
-      end
-    end
+    @device.join
   end
 
   def start_discovery_thread
@@ -111,7 +88,7 @@ class MQTTBridge
   def setup_discovery
     @discovery_object = IntesisBox::Discovery.new do |details|
       # force a reconnect to WMPs that have moved
-      mac = details[:mac]
+      mac = MQTT::Homie.escape_id(details[:mac])
       known_wmp = @wmps[mac]
       if known_wmp && known_wmp.ip != details[:ip]
         @wmps.delete(mac)
@@ -119,7 +96,6 @@ class MQTTBridge
 
       next true if @wmps.key?(mac)
 
-      publish("$state", "init")
       wmp = IntesisBox::Client.new(details[:ip])
 
       loop do
@@ -132,169 +108,83 @@ class MQTTBridge
       next true unless wmp.mac
 
       puts "Found new WMP #{wmp.mac} (#{wmp.devicename})"
-      publish_wmp(wmp)
+      @wmps[MQTT::Homie.escape_id(wmp.mac)] = wmp
+      node = publish_wmp(wmp)
 
       Thread.new do
+        iter = 0
         loop do
           next wmp.ping unless wmp.poll
-          publish_attribute("#{wmp.mac}/ip", wmp.ip)
-          publish_attribute("#{wmp.mac}/onoff", wmp.onoff)
-          publish_attribute("#{wmp.mac}/mode", wmp.mode) if wmp.limits[:mode]&.length.to_i > 0
-          publish_attribute("#{wmp.mac}/fansp", wmp.fansp) if wmp.limits[:fansp]&.length.to_i > 0
-          publish_attribute("#{wmp.mac}/vaneud", wmp.vaneud) if wmp.limits[:vaneud]&.length.to_i > 0
-          publish_attribute("#{wmp.mac}/vanelr", wmp.vanelr) if wmp.limits[:vanelr]&.length.to_i > 0
-          publish_attribute("#{wmp.mac}/setptemp", convert_units(wmp.setptemp)) if wmp.setptemp
-          publish_attribute("#{wmp.mac}/ambtemp", convert_units(wmp.ambtemp)) if wmp.ambtemp
-          publish_attribute("#{wmp.mac}/errstatus", wmp.errstatus)
-          publish_attribute("#{wmp.mac}/errcode", wmp.errcode)
-          publish_attribute("#{wmp.mac}/devicename", wmp.devicename)
-          publish_attribute("#{wmp.mac}/$name", wmp.devicename)
+
+          node.name = wmp.devicename
+          node.properties['ip'].value = wmp.ip
+          node.properties['onoff'].value = wmp.onoff
+          node.properties['mode'].value = wmp.mode if wmp.limits[:mode]&.length.to_i > 0
+          node.properties['fansp'].value = wmp.fansp if wmp.limits[:fansp]&.length.to_i > 0
+          node.properties['vaneud'].value = wmp.vaneud if wmp.limits[:vaneud]&.length.to_i > 0
+          node.properties['vanelr'].value = wmp.vanelr if wmp.limits[:vanelr]&.length.to_i > 0
+          node.properties['setptemp'].value = convert_units(wmp.setptemp) if wmp.setptemp
+          node.properties['ambtemp'].value = convert_units(wmp.ambtemp) if wmp.ambtemp
+          node.properties['errstatus'].value = wmp.errstatus
+          node.properties['errcode'].value = wmp.errcode
+          node.properties['devicename'].value = wmp.devicename
         end
       rescue => e
         puts "Lost connection to #{wmp.mac} (#{wmp.devicename}): #{e}"
         remove_wmp(wmp)
       end
-      @wmps[wmp.mac] = wmp
-      publish("$nodes", (["bridge"] + @wmps.keys.sort).join(","))
-      publish("$state", "ready")
       true
     end
   end
 
-  def publish(topic, value)
-    @mqtt.publish("#{@base_topic}/#{topic}", value, true, 1)
-  end
-
-  def publish_attribute(attr, value)
-    if !@attributes.key?(attr) || @attributes[attr] != value
-      publish(attr, value.to_s)
-      @attributes[attr] = value
-    end
-  end
-
-  def subscribe(topic)
-    @mqtt.subscribe("#{@base_topic}/#{topic}")
-  end
-
-  def unsubscribe(topic)
-    @mqtt.unsubscribe("#{@base_topic}/#{topic}")
-  end
-
-  def publish_basic_attributes
-    publish("$homie", "v4.0.0")
-    publish("$name", "IntesisBox")
-    publish("$state", "init")
-
-    publish("bridge/$name", "Bridge")
-    publish("bridge/$type", "Bridge")
-    publish("bridge/$properties", "discover")
-
-    publish("bridge/discovery/$name", "Auto-Discovery Interval")
-    publish("bridge/discovery/$datatype", "integer")
-    publish("bridge/discovery/$settable", "true")
-    publish("bridge/discovery/$format", "0:86400")
-    publish("bridge/discovery/$unit", "s")
-    subscribe("bridge/discovery")
-    subscribe("bridge/discovery/set")
-
-    publish("bridge/units/$name", "Units")
-    publish("bridge/units/$datatype", "enum")
-    publish("bridge/units/$settable", "true")
-    publish("bridge/units/$format", "C,F")
-    subscribe("bridge/units")
-    subscribe("bridge/units/set")
-
-    subscribe("+/devicename/set")
-    subscribe("+/onoff/set")
-    subscribe("+/mode/set")
-    subscribe("+/fansp/set")
-    subscribe("+/vaneud/set")
-    subscribe("+/vanelr/set")
-    subscribe("+/setptemp/set")
-  end
-
   def publish_wmp(wmp)
-    publish("#{wmp.mac}/$name", wmp.devicename)
-    publish("#{wmp.mac}/$type", wmp.model)
-    properties = []
-    
-    properties << "devicename"
-    publish("#{wmp.mac}/devicename/$name", "Device Name")
-    publish("#{wmp.mac}/devicename/$datatype", "string")
-    publish("#{wmp.mac}/devicename/$settable", "true")
-
-    properties << "ip"
-    publish("#{wmp.mac}/ip/$name", "IP Address")
-    publish("#{wmp.mac}/ip/$datatype", "string")
-
-    properties << 'onoff'
-    publish("#{wmp.mac}/onoff/$name", "AC unit On or Off")
-    publish("#{wmp.mac}/onoff/$datatype", "boolean")
-    publish("#{wmp.mac}/onoff/$settable", "true")
-
-    if wmp.limits[:mode]&.length.to_i > 0
-      properties << 'mode'
-      publish("#{wmp.mac}/mode/$name", "Mode (heat, cool, fan, dry or auto)")
-      publish("#{wmp.mac}/mode/$datatype", "enum")
-      publish("#{wmp.mac}/mode/$format", wmp.limits[:mode].join(","))
-      publish("#{wmp.mac}/mode/$settable", "true")
+    generic_property = ->(prop, value) do
+      wmp = @wmps[prop.node.id]
+      wmp.send("#{prop.id}=", value)
     end
 
-    if wmp.limits[:fansp]&.length.to_i > 0
-      properties << 'fansp'
-      publish("#{wmp.mac}/fansp/$name", "Fan speed")
-      publish("#{wmp.mac}/fansp/$datatype", "enum")
-      publish("#{wmp.mac}/fansp/$format", wmp.limits[:fansp].join(","))
-      publish("#{wmp.mac}/fansp/$settable", "true")
+    node = nil
+    @device.node(MQTT::Homie.escape_id(wmp.mac), wmp.devicename, wmp.model) do |n|
+      node = n
+      node.property("devicename", "Device Name", :string, &generic_property).
+        property("ip", "IP Address", "string").
+        property("onoff", "AC unit On or Off", "boolean") do |prop, value|
+        wmp = @wmps[prop.node.id]
+        wmp.onoff = value == 'true'
+      end
+
+      if wmp.limits[:mode]&.length.to_i > 0
+        node.property("mode", "Mode (heat, cool, fan, dry or auto)", :enum, format: wmp.limits[:mode].join(","), &generic_property)
+      end
+
+      if wmp.limits[:fansp]&.length.to_i > 0
+        node.property("fansp", "Fan speed", :enum, format: wmp.limits[:fansp].join(","), &generic_property)
+      end
+
+      if wmp.limits[:vaneud]&.length.to_i > 0
+        node.property("vaneud", "Up/Down vane position", :enum, format: wmp.limits[:vaneud].join(","), &generic_property)
+      end
+
+      if wmp.limits[:vanelr]&.length.to_i > 0
+        node.property("vanelr", "Left/Right vane position", :enum, format: wmp.limits[:vanelr].join(","), &generic_property)
+      end
+
+      node.property("setptemp", "Set point temperature", :float, unit: "º#{@units}", format: wmp.limits[:setptemp].map { |lim| convert_units(lim) }.join(":")) do |prop, value|
+        wmp = @mps[prop.node.id]
+        wmp.setptemp = convert_units_set(value.to_f)
+      end.
+        property("ambtemp", "Ambient temperature", :float, unit: "º#{@units}").
+        property("errstatus", "Shows if any error occurs", :string).
+        property("errcode", "Error code", :integer)
     end
-
-    if wmp.limits[:vaneud]&.length.to_i > 0
-      properties << 'vaneud'
-      publish("#{wmp.mac}/vaneud/$name", "Up/Down vane position")
-      publish("#{wmp.mac}/vaneud/$datatype", "enum")
-      publish("#{wmp.mac}/vaneud/$format", wmp.limits[:vaneud].join(","))
-      publish("#{wmp.mac}/vaneud/$settable", "true")
-    end
-
-    if wmp.limits[:vanelr]&.length.to_i > 0
-      properties << 'vanelr'
-      publish("#{wmp.mac}/vanelr/$name", "Left/Right vane position")
-      publish("#{wmp.mac}/vanelr/$datatype", "enum")
-      publish("#{wmp.mac}/vanelr/$format", wmp.limits[:vanelr].join(","))
-      publish("#{wmp.mac}/vanelr/$settable", "true")
-    end
-
-    properties << 'setptemp'
-    publish("#{wmp.mac}/setptemp/$name", "Set point temperature")
-    publish("#{wmp.mac}/setptemp/$datatype", "float")
-    publish("#{wmp.mac}/setptemp/$format",
-      wmp.limits[:setptemp].map { |lim| convert_units(lim) }.join(":"))
-    publish("#{wmp.mac}/setptemp/$unit", "º#{@units}")
-    publish("#{wmp.mac}/setptemp/$settable", "true")
-
-    properties << 'ambtemp'
-    publish("#{wmp.mac}/ambtemp/$name", "Ambient temperature")
-    publish("#{wmp.mac}/ambtemp/$datatype", "float")
-    publish("#{wmp.mac}/ambtemp/$unit", "º#{@units}")
-
-    properties << 'errstatus'
-    publish("#{wmp.mac}/errstatus/$name", "Shows if any error occurs")
-    publish("#{wmp.mac}/errstatus/$datatype", "string")
-
-    properties << 'errcode'
-    publish("#{wmp.mac}/errcode/$name", "Error code")
-    publish("#{wmp.mac}/errcode/$datatype", "integer")
-
-    publish("#{wmp.mac}/$properties", properties.join(","))
+    node
   end
 
   def remove_wmp(wmp)
-    @wmps.delete(wmp.mac)
-    @mqtt.publish("$state", "init")
-    publish("$nodes", (["bridge"] + @wmps.keys.sort).join(","))
-    publish("$state", "ready")
+    mac = MQTT::Homie.escape_id(wmp.mac)
+    @wmps.delete(mac)
+    @device.remove_node(mac)
   end
-
 
   def convert_units(value)
     return value if @units == :C
@@ -305,7 +195,6 @@ class MQTTBridge
     return value if @units == :C
     (value - 32) * 5/9.0
   end
-
 end
 
 mqtt_uri = ARGV[0]

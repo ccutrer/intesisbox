@@ -1,13 +1,15 @@
 PATH
   remote: .
   specs:
-    intesisbox (0.0.1)
-      mqtt (~> 0.5.0)
+    intesisbox (0.0.2)
+      homie-mqtt (~> 1.0.0)
 
 GEM
   remote: https://rubygems.org/
   specs:
     byebug (9.1.0)
+    homie-mqtt (1.0.0)
+      mqtt (~> 0.5.0)
     mqtt (0.5.0)
     rake (13.0.1)
 
