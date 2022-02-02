@@ -1,72 +1,48 @@
 #!/usr/bin/env ruby
+# frozen_string_literal: true
 
-require 'intesisbox'
-require 'homie-mqtt'
+require "intesisbox"
+require "homie-mqtt"
 
 class MQTTBridge
-  def initialize(mqtt_uri, root_topic: nil)
+  def initialize(mqtt_uri, devices: [], root_topic: nil, bind_addr: "0.0.0.0")
     @base_topic = "homie/intesisbox"
+    @bind_addr = bind_addr
 
-    bridge, discovery_property, units_property = nil
-    @device = MQTT::Homie::Device.new("intesisbox", "IntesisBox", root_topic: root_topic, mqtt: mqtt_uri) do |topic, value|
+    bridge, discovery_property = nil
+    @device = MQTT::Homie::Device.new("intesisbox", "IntesisBox", root_topic: root_topic,
+                                                                  mqtt: mqtt_uri) do |topic, value|
       if topic == discovery_property.topic
         @device.mqtt.unsubscribe(topic)
         discovery_property.set(value) unless @got_discovery
         @got_discovery = true
-      elsif topic == units_property.topic
-        @device.mqtt.unsubscribe(topic)
-        units_property.set(value) unless @got_units
-        @got_units = true
       end
     end
 
+    @explicit_devices = devices
     @wmps = {}
-    @discovery = 300
-    @units = :C
+    @discovery = 30
 
     bridge = nil
     @device.node("bridge", "Bridge", "Bridge") do |node|
-      (bridge = node).property("discovery", "Auto-Discovery Interval", :integer, format: "0:86400", unit: "s") do |prop, value|
-        next unless value =~ /^\d+$/
-        value = value.to_i
-        next if value > 86400
+      (bridge = node).property("discovery",
+                               "Auto-Discovery Interval",
+                               :integer,
+                               @discovery,
+                               format: 0..86_400,
+                               unit: "s") do |value, prop|
         old_value = @discovery
-        prop.value = value
-        @discovery = value
-        if value < old_value || old_value == 0
+        prop.value = (@discovery = value)
+        if value < old_value || old_value.zero?
           @discovery_thread.kill
           start_discovery_thread
         end
-      end.
-      property("units", "Units", :enum, format: "C,F") do |prop, value|
-        next unless %w{C F}.include?(value)
-        if prop.value != value
-          prop.value = value
-          @units = value.to_sym
-          next if @wmps.empty?
-          @device.init do
-            @wmps.each do |(mac, wmp)|
-              node = @device.nodes[mac]
-              setptemp = node.properties['setptemp']
-              setptemp.value = convert_units(wmp.setptemp)
-              setptemp.unit = "º#{@units}"
-              setptemp.format = wmp.limits[:setptemp].map { |lim| convert_units(lim) }.join(":")
-              if wmp.ambtemp
-                ambtemp = node.properties['ambtemp']
-                ambtemp.value = convert_units(wmp.ambtemp)
-                ambtemp.unit = "º#{@units}"
-              end
-            end
-          end
-        end
       end
     end
-    discovery_property = bridge.properties['discovery']
-    units_property = bridge.properties['units']
+    discovery_property = bridge["discovery"]
     @device.publish
     # use MQTT itself as our state store
-    @device.mqtt.subscribe("#{discovery_property.topic}")
-    @device.mqtt.subscribe("#{units_property.topic}")
+    @device.mqtt.subscribe(discovery_property.topic)
 
     setup_discovery
     start_discovery_thread
@@ -76,108 +52,118 @@ class MQTTBridge
 
   def start_discovery_thread
     @discovery_thread = Thread.new do
+      connect_explicit_devices
       @discovery_object.discover
       loop do
-        break if @discovery == 0
+        break if @discovery.zero?
+
         sleep(@discovery)
+        connect_explicit_devices
         @discovery_object.discover
       end
     end
   end
 
+  def connect_explicit_devices
+    @explicit_devices.each do |addr|
+      next if @wmps.any? do |_, wmp|
+        wmp.ip == addr
+      end
+
+      add_wmp(addr)
+    end
+  end
+
   def setup_discovery
-    @discovery_object = IntesisBox::Discovery.new do |details|
+    @discovery_object = IntesisBox::Discovery.new(bind_addr: @bind_addr) do |details|
       # force a reconnect to WMPs that have moved
       mac = MQTT::Homie.escape_id(details[:mac])
       known_wmp = @wmps[mac]
-      if known_wmp && known_wmp.ip != details[:ip]
-        @wmps.delete(mac)
-      end
+      @wmps.delete(mac) if known_wmp && known_wmp.ip != details[:ip]
 
       next true if @wmps.key?(mac)
 
-      wmp = IntesisBox::Client.new(details[:ip])
-
-      loop do
-        break if wmp.mac
-        unless wmp.poll(1)
-          puts "unable to talk to #{wmp.mac}"
-          break
-        end
-      end
-      next true unless wmp.mac
-
-      puts "Found new WMP #{wmp.mac} (#{wmp.devicename})"
-      @wmps[MQTT::Homie.escape_id(wmp.mac)] = wmp
-      node = publish_wmp(wmp)
-
-      Thread.new do
-        iter = 0
-        loop do
-          next wmp.ping unless wmp.poll
-
-          node.name = wmp.devicename
-          node.properties['ip'].value = wmp.ip
-          node.properties['onoff'].value = wmp.onoff
-          node.properties['mode'].value = wmp.mode if wmp.limits[:mode]&.length.to_i > 0
-          node.properties['fansp'].value = wmp.fansp if wmp.limits[:fansp]&.length.to_i > 0
-          node.properties['vaneud'].value = wmp.vaneud if wmp.limits[:vaneud]&.length.to_i > 0
-          node.properties['vanelr'].value = wmp.vanelr if wmp.limits[:vanelr]&.length.to_i > 0
-          node.properties['setptemp'].value = convert_units(wmp.setptemp) if wmp.setptemp
-          node.properties['ambtemp'].value = convert_units(wmp.ambtemp) if wmp.ambtemp
-          node.properties['errstatus'].value = wmp.errstatus
-          node.properties['errcode'].value = wmp.errcode
-          node.properties['devicename'].value = wmp.devicename
-        end
-      rescue => e
-        puts "Lost connection to #{wmp.mac} (#{wmp.devicename}): #{e}"
-        remove_wmp(wmp)
-      end
+      add_wmp(details[:ip])
       true
     end
   end
 
+  def add_wmp(addr)
+    wmp = IntesisBox::Client.new(addr)
+
+    loop do
+      break if wmp.mac
+
+      unless wmp.poll(1)
+        IntesisBox.logger.warn "unable to talk to #{wmp.ip}"
+        break
+      end
+    end
+    return unless wmp.mac
+
+    IntesisBox.logger.info "Found new WMP #{wmp.mac} (#{wmp.devicename})"
+    @wmps[MQTT::Homie.escape_id(wmp.mac)] = wmp
+    node = publish_wmp(wmp)
+
+    Thread.new do
+      loop do
+        next wmp.ping unless wmp.poll
+
+        node.name = wmp.devicename
+        node["ip"].value = wmp.ip
+        node["onoff"].value = wmp.onoff
+        node["mode"].value = wmp.mode if wmp.limits[:mode]&.length.to_i.positive?
+        node["fansp"].value = wmp.fansp if wmp.limits[:fansp]&.length.to_i.positive?
+        node["vaneud"].value = wmp.vaneud if wmp.limits[:vaneud]&.length.to_i.positive?
+        node["vanelr"].value = wmp.vanelr if wmp.limits[:vanelr]&.length.to_i.positive?
+        node["setptemp"].value = wmp.setptemp if wmp.setptemp
+        node["ambtemp"].value = wmp.ambtemp if wmp.ambtemp
+        node["errstatus"].value = wmp.errstatus
+        node["errcode"].value = wmp.errcode
+        node["devicename"].value = wmp.devicename
+      end
+    rescue => e
+      IntesisBox.logger.warn "Lost connection to #{wmp.mac} (#{wmp.devicename}): #{e}"
+      remove_wmp(wmp)
+    end
+  end
+
   def publish_wmp(wmp)
-    generic_property = ->(prop, value) do
+    generic_property = lambda do |value, prop|
       wmp = @wmps[prop.node.id]
       wmp.send("#{prop.id}=", value)
     end
 
-    node = nil
-    @device.node(MQTT::Homie.escape_id(wmp.mac), wmp.devicename, wmp.model) do |n|
-      node = n
-      node.property("devicename", "Device Name", :string, &generic_property).
-        property("ip", "IP Address", "string").
-        property("onoff", "AC unit On or Off", "boolean") do |prop, value|
-        wmp = @wmps[prop.node.id]
-        wmp.onoff = value == 'true'
+    @device.node(MQTT::Homie.escape_id(wmp.mac), wmp.devicename, wmp.model) do |node|
+      node.property("devicename", "Device Name", :string, wmp.devicename, &generic_property)
+      node.property("ip", "IP Address", :string, wmp.ip)
+      node.property("onoff", "AC unit On or Off", :boolean, wmp.onoff, &generic_property)
+
+      if wmp.limits[:mode]&.length.to_i.positive?
+        node.property("mode", "Mode (heat, cool, fan, dry or auto)", :enum, wmp.mode, format: wmp.limits[:mode],
+                      &generic_property)
       end
 
-      if wmp.limits[:mode]&.length.to_i > 0
-        node.property("mode", "Mode (heat, cool, fan, dry or auto)", :enum, format: wmp.limits[:mode].join(","), &generic_property)
+      if wmp.limits[:fansp]&.length.to_i.positive?
+        node.property("fansp", "Fan speed", :enum, wmp.fansp, format: wmp.limits[:fansp], &generic_property)
       end
 
-      if wmp.limits[:fansp]&.length.to_i > 0
-        node.property("fansp", "Fan speed", :enum, format: wmp.limits[:fansp].join(","), &generic_property)
+      if wmp.limits[:vaneud]&.length.to_i.positive?
+        node.property("vaneud", "Up/Down vane position", :enum, wmp.vaneud, format: wmp.limits[:vaneud],
+                      &generic_property)
       end
 
-      if wmp.limits[:vaneud]&.length.to_i > 0
-        node.property("vaneud", "Up/Down vane position", :enum, format: wmp.limits[:vaneud].join(","), &generic_property)
+      if wmp.limits[:vanelr]&.length.to_i.positive?
+        node.property("vanelr", "Left/Right vane position", :enum, wmp.vanelr, format: wmp.limits[:vanelr],
+                      &generic_property)
       end
 
-      if wmp.limits[:vanelr]&.length.to_i > 0
-        node.property("vanelr", "Left/Right vane position", :enum, format: wmp.limits[:vanelr].join(","), &generic_property)
-      end
-
-      node.property("setptemp", "Set point temperature", :float, unit: "º#{@units}", format: wmp.limits[:setptemp].map { |lim| convert_units(lim) }.join(":")) do |prop, value|
-        wmp = @wmps[prop.node.id]
-        wmp.setptemp = convert_units_set(value.to_f)
-      end.
-        property("ambtemp", "Ambient temperature", :float, unit: "º#{@units}").
-        property("errstatus", "Shows if any error occurs", :string).
-        property("errcode", "Error code", :integer)
+      node.property("setptemp", "Set point temperature", :float, wmp.setptemp,
+                    unit: "°C", format: Range.new(*wmp.limits[:setptemp]), &generic_property)
+      node.property("ambtemp", "Ambient temperature", :float, unit: "°C")
+      node.property("errstatus", "Shows if any error occurs", :string, wmp.errstatus)
+      node.property("errcode", "Error code", :integer, wmp.errcode)
     end
-    node
   end
 
   def remove_wmp(wmp)
@@ -185,17 +171,37 @@ class MQTTBridge
     @wmps.delete(mac)
     @device.remove_node(mac)
   end
+end
 
-  def convert_units(value)
-    return value if @units == :C
-    value * 9/5.0 + 32
+require "optparse"
+
+devices = nil
+bind = nil
+
+options = OptionParser.new do |opts|
+  opts.banner = "Usage: intesisbox_mqtt_bridge MQTT_URI [options]"
+
+  opts.on("-b", "--bind ADDRESS", "Address to bind to") do |v|
+    bind = v
   end
-
-  def convert_units_set(value)
-    return value if @units == :C
-    (value - 32) * 5/9.0
+  opts.on("-d", "--device x,y,z", Array, "List of devices to explicitly connect to") do |list|
+    devices = list
+  end
+  opts.on("-h", "--help", "Prints this help") do
+    warn opts
+    exit
   end
 end
 
+options.parse!
+
+unless ARGV.length == 1
+  warn options
+  exit 1
+end
+
+Thread.abort_on_exception
+IntesisBox.logger = Logger.new($stdout)
+
 mqtt_uri = ARGV[0]
-MQTTBridge.new(mqtt_uri)
+MQTTBridge.new(mqtt_uri, devices: devices, bind_addr: bind || "0.0.0.0")

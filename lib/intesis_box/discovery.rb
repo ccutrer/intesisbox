@@ -1,14 +1,17 @@
-require 'socket'
+# frozen_string_literal: true
+
+require "socket"
 
 module IntesisBox
   class Discovery
     class << self
-      def discover(timeout: 1, expected_count: nil, expect: nil)
+      def discover(timeout: 1, expected_count: nil, expect: nil, bind_addr: "0.0.0.0")
         wmps = {}
-        discovery = new(timeout: timeout) do |wmp|
+        discovery = new(timeout: timeout, bind_addr: bind_addr) do |wmp|
           wmps[wmp[:mac]] = wmp
           next false if wmps.length == expected_count
           next false if expect && wmp[:mac] == expect
+
           true
         end
         wmps
@@ -17,29 +20,27 @@ module IntesisBox
       end
     end
 
-    def initialize(timeout: nil)
+    def initialize(timeout: nil, bind_addr: "0.0.0.0")
       @socket = UDPSocket.new
-      @socket.bind("0.0.0.0", 3310)
+      @socket.bind(bind_addr, 3310)
       @socket.setsockopt(Socket::SOL_SOCKET, Socket::SO_BROADCAST, true)
       @found = []
 
-      receive_lambda = -> do
+      receive_lambda = lambda do
         loop do
-          if IO.select([@socket], nil, nil, timeout)
-            @socket.wait_readable
-            msg, _ = @socket.recvfrom(128)
-            next unless msg.start_with?("DISCOVER:")
-            msg = msg[9..-1]
+          break unless @socket.wait_readable(timeout)
 
-            model, mac, ip, protocol, version, rssi, name, _, _ = msg.split(",")
-            wmp = { mac: mac, model: model, ip: ip, protocol: protocol, version: version, rssi: rssi, name: name }
-            if block_given?
-              break unless yield wmp
-            else
-              @found << wmp
-            end
+          msg, = @socket.recvfrom(128)
+          next unless msg.start_with?("DISCOVER:")
+
+          msg = msg[9..-1]
+
+          model, mac, ip, protocol, version, rssi, name, = msg.split(",")
+          wmp = { mac: mac, model: model, ip: ip, protocol: protocol, version: version, rssi: rssi, name: name }
+          if block_given?
+            break unless yield wmp
           else
-            break
+            @found << wmp
           end
         end
       end
@@ -58,11 +59,12 @@ module IntesisBox
     end
 
     def discover
-      @socket.sendmsg("DISCOVER\r\n", 0, Socket.sockaddr_in(3310, '255.255.255.255'))
+      @socket.sendmsg("DISCOVER\r\n", 0, Socket.sockaddr_in(3310, "255.255.255.255"))
     end
 
     def pending_discoveries
-      result, @found = @found, []
+      result = @found
+      @found = []
       result
     end
   end
