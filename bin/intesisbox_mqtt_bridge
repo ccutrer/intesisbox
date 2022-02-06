@@ -89,17 +89,22 @@ class MQTTBridge
   end
 
   def add_wmp(addr)
-    wmp = IntesisBox::Client.new(addr)
+    begin
+      wmp = IntesisBox::Client.new(addr)
 
-    loop do
-      break if wmp.mac
+      loop do
+        break if wmp.mac
 
-      unless wmp.poll(1)
-        IntesisBox.logger.warn "unable to talk to #{wmp.ip}"
-        break
+        unless wmp.poll(1)
+          IntesisBox.logger.warn "unable to talk to #{wmp.ip}"
+          break
+        end
       end
+      return unless wmp.mac
+    rescue => e
+      IntesisBox.logger.warn "unable to talk to #{addr}: #{e}"
+      return
     end
-    return unless wmp.mac
 
     IntesisBox.logger.info "Found new WMP #{wmp.mac} (#{wmp.devicename})"
     @wmps[MQTT::Homie.escape_id(wmp.mac)] = wmp
@@ -111,6 +116,7 @@ class MQTTBridge
 
         node.name = wmp.devicename
         node["ip"].value = wmp.ip
+        node["rssi"].value = wmp.rssi
         node["onoff"].value = wmp.onoff
         node["mode"].value = wmp.mode if wmp.limits[:mode]&.length.to_i.positive?
         node["fansp"].value = wmp.fansp if wmp.limits[:fansp]&.length.to_i.positive?
@@ -123,7 +129,7 @@ class MQTTBridge
         node["devicename"].value = wmp.devicename
       end
     rescue => e
-      IntesisBox.logger.warn "Lost connection to #{wmp.mac} (#{wmp.devicename}): #{e}"
+      IntesisBox.logger.warn "Lost connection to #{wmp.mac} (#{wmp.devicename}): #{e}\n#{e.backtrace.first}"
       remove_wmp(wmp)
     end
   end
@@ -137,6 +143,7 @@ class MQTTBridge
     @device.node(MQTT::Homie.escape_id(wmp.mac), wmp.devicename, wmp.model) do |node|
       node.property("devicename", "Device Name", :string, wmp.devicename, &generic_property)
       node.property("ip", "IP Address", :string, wmp.ip)
+      node.property("rssi", "WiFi RSSI", :integer, wmp.rssi)
       node.property("onoff", "AC unit On or Off", :boolean, wmp.onoff, &generic_property)
 
       if wmp.limits[:mode]&.length.to_i.positive?
@@ -160,7 +167,7 @@ class MQTTBridge
 
       node.property("setptemp", "Set point temperature", :float, wmp.setptemp,
                     unit: "°C", format: Range.new(*wmp.limits[:setptemp]), &generic_property)
-      node.property("ambtemp", "Ambient temperature", :float, unit: "°C")
+      node.property("ambtemp", "Ambient temperature", :float, wmp.ambtemp, unit: "°C") unless wmp.ambtemp.nil?
       node.property("errstatus", "Shows if any error occurs", :string, wmp.errstatus)
       node.property("errcode", "Error code", :integer, wmp.errcode)
     end
@@ -200,7 +207,7 @@ unless ARGV.length == 1
   exit 1
 end
 
-Thread.abort_on_exception
+Thread.abort_on_exception = true
 IntesisBox.logger = Logger.new($stdout)
 
 mqtt_uri = ARGV[0]

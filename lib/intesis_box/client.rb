@@ -17,7 +17,8 @@ module IntesisBox
       puts("CFG:DEVICENAME")
       poll(0.25)
       puts("GET,1:*")
-      poll(0.25)
+      # keep consuming messages while they're still coming
+      loop while poll(0.5)
       # this is purposely last, since mac is what we check for it being ready
       puts("ID")
       poll(0.25)
@@ -31,7 +32,7 @@ module IntesisBox
 
       loop do
         line = @io.readline.strip
-        IntesisBox.logger&.debug("Read #{line.inspect}")
+        IntesisBox.logger&.debug("Read #{line.inspect} from #{mac || ip}")
         cmd, args = line.split(":", 2)
         case cmd
         when "ID"
@@ -46,7 +47,7 @@ module IntesisBox
         when "CHN,1"
           function, value = args.split(",")
           value = value == "ON" if function == "ONOFF"
-          value = nil if value == "-32678"
+          value = nil if value == "-32768"
           value = value.to_f / 10 if value && TEMP_ATTRS.include?(function)
           value = value.to_i if function == "ERRCODE"
           instance_variable_set(:"@#{function.downcase}", value)
@@ -92,7 +93,7 @@ module IntesisBox
     private
 
     def puts(line)
-      IntesisBox.logger&.debug("Writing #{line.inspect}")
+      IntesisBox.logger&.debug("Writing #{line.inspect} to #{mac || ip}")
       @io.puts(line)
     end
   end
