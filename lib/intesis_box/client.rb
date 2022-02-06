@@ -54,6 +54,8 @@ module IntesisBox
         when "CFG"
           function, value = args.split(",", 2)
           @devicename = value if function == "DEVICENAME"
+        when "PONG"
+          @rssi = args.to_i
         end
         break unless @io.ready?
       end
